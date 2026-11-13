@@ -23019,6 +23019,52 @@ async function imdRequestCheck(chain, a, fetchImpl = fetch) {
   return { ok: r.ok && blockers.length === 0 && onchainQuestionMatches, blockers, question, onchainQuestionMatches, response: j };
 }
 
+// live/job-flow.ts
+var PHASE = { OPEN: PHASES.indexOf("OPEN"), COMMIT: PHASES.indexOf("COMMIT"), REVEAL: PHASES.indexOf("REVEAL"), CANCELLED: PHASES.indexOf("CANCELLED") };
+async function waitPast(d, jobId, phase) {
+  for (; ; ) {
+    const j = await d.job(jobId);
+    if (Number(j.phase) !== phase) return;
+    if (await d.now() > BigInt(j.deadline)) {
+      try {
+        await d.timeout(jobId, phase);
+      } catch (e) {
+        d.log(`    timeout not yet possible: ${String(e.message).slice(0, 120)}`);
+      }
+      if (Number((await d.job(jobId)).phase) !== phase) return;
+    }
+    await d.sleep(15e3);
+  }
+}
+async function drawAndCommit(d, jobId, tag) {
+  for (; ; ) {
+    for (let i = 0; i < 40; i++) {
+      const j = await d.job(jobId);
+      if (Number(j.phase) >= PHASE.COMMIT) break;
+      try {
+        await d.draw(jobId);
+      } catch (e) {
+        d.log(`    draw not yet possible: ${String(e.message).slice(0, 120)}`);
+        await d.sleep(15e3);
+      }
+    }
+    const drawn = await d.armsOf(jobId);
+    d.log(`    drawn: ${drawn.join(", ")}`);
+    const foreign = drawn.filter((a) => !d.mine(a));
+    d.drawn(drawn, foreign);
+    const own = drawn.filter((a) => d.mine(a));
+    for (const a of own) await d.commit(a);
+    if (foreign.length) await waitPast(d, jobId, PHASE.COMMIT);
+    else for (let i = 0; i < 20 && Number((await d.job(jobId)).phase) === PHASE.COMMIT; i++) await d.sleep(5e3);
+    const phase = Number((await d.job(jobId)).phase);
+    if (phase === PHASE.OPEN) {
+      d.log(`    ${tag}: job ${jobId} reopened to OPEN (a drawn arm did not commit before the deadline); drawing again`);
+      continue;
+    }
+    return { drawn, own, foreign, phase };
+  }
+}
+
 // live/live-run.ts
 var { values: o } = parseArgs({ strict: false, options: {
   config: { type: "string", default: "arms.config.json" },
@@ -23164,21 +23210,35 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
     saveState();
     return h.values;
   };
-  const waitPast = async (jobId, phase, tag) => {
-    for (; ; ) {
-      const j = await chain.job(jobId);
-      if (Number(j.phase) !== phase) return;
-      if (await chain.now() > BigInt(j.deadline)) {
-        try {
-          await tx(funder, plans.arms(cfg, `${tag}: timeout job ${jobId} in ${PHASES[phase]}`, "timeout", [jobId]));
-        } catch (e) {
-          log(`    timeout not yet possible: ${String(e.message).slice(0, 120)}`);
-        }
-        if (Number((await chain.job(jobId)).phase) !== phase) return;
+  const flow = (tag, jobId, vals) => ({
+    job: (id) => chain.job(id),
+    armsOf: (id) => chain.arms("armsOf", id),
+    now: () => chain.now(),
+    draw: (id) => tx(funder, plans.arms(cfg, `${tag}: draw job ${id}`, "draw", [id])),
+    timeout: (id, phase) => tx(funder, plans.arms(cfg, `${tag}: timeout job ${id} in ${PHASES[phase]}`, "timeout", [id])),
+    commit: async (a) => {
+      const w = mine(a);
+      const v = vals(a);
+      const id = SaltStore.id(11155111, cfg.arms, jobId, a);
+      const rec = store.prepare(id, jobId, a, v, `live-run:${tag}`);
+      const e = await chain.entry(jobId, a);
+      if (!e.committed) {
+        await tx(w, plans.arms(cfg, `${tag}: commit job ${jobId} by ${a}`, "commit", [jobId, a, rec.hash]));
+        store.mark(id, "committed");
       }
-      await sleep(15e3);
-    }
-  };
+    },
+    mine: (a) => !!mine(a),
+    drawn: (drawn, foreign) => {
+      state[tag].drawn = drawn;
+      if (foreign.length) {
+        const m = `${tag}: the draw picked arm(s) that are not this script's wallets (${foreign.join(", ")}); they answer on their own, the script commits only for its arms and waits for the phase deadlines`;
+        log(`    ${m}`);
+        if (!mismatches.includes(m)) mismatches.push(m);
+      }
+    },
+    log,
+    sleep
+  });
   const runJob = async (tag, vals, atBlock) => {
     if (state[tag]?.settled) return BigInt(state[tag].jobId);
     let jobId;
@@ -23193,40 +23253,9 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
       saveState();
     }
     log(`  ${tag}: job ${jobId}`);
-    for (let i = 0; i < 40; i++) {
-      const j3 = await chain.job(jobId);
-      if (Number(j3.phase) >= 2) break;
-      try {
-        await tx(funder, plans.arms(cfg, `${tag}: draw job ${jobId}`, "draw", [jobId]));
-      } catch (e) {
-        log(`    draw not yet possible: ${String(e.message).slice(0, 120)}`);
-        await sleep(15e3);
-      }
-    }
-    const drawn = await chain.arms("armsOf", jobId);
-    log(`    drawn: ${drawn.join(", ")}`);
-    state[tag].drawn = drawn;
-    const foreign = drawn.filter((a) => !mine(a));
-    if (foreign.length) {
-      const m = `${tag}: the draw picked arm(s) that are not this script's wallets (${foreign.join(", ")}); they answer on their own, the script commits only for its arms and waits for the phase deadlines`;
-      log(`    ${m}`);
-      if (!mismatches.includes(m)) mismatches.push(m);
-    }
-    const own = drawn.filter((a) => mine(a));
-    for (const a of own) {
-      const w = mine(a);
-      const v = vals(a);
-      const id = SaltStore.id(11155111, cfg.arms, jobId, a);
-      const rec = store.prepare(id, jobId, a, v, `live-run:${tag}`);
-      const e = await chain.entry(jobId, a);
-      if (!e.committed) {
-        await tx(w, plans.arms(cfg, `${tag}: commit job ${jobId} by ${a}`, "commit", [jobId, a, rec.hash]));
-        store.mark(id, "committed");
-      }
-    }
-    if (foreign.length) await waitPast(jobId, 2, tag);
-    else for (let i = 0; i < 20 && Number((await chain.job(jobId)).phase) === 2; i++) await sleep(5e3);
-    if (Number((await chain.job(jobId)).phase) === 8) {
+    const deps = flow(tag, jobId, vals);
+    const { own, foreign } = await drawAndCommit(deps, jobId, tag);
+    if (Number((await chain.job(jobId)).phase) === PHASE.CANCELLED) {
       delete state[tag];
       saveState();
       throw new Error(`${tag}: job ${jobId} was cancelled (not enough commits); rerun to post a new job`);
@@ -23240,7 +23269,7 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
         store.mark(id, "revealed");
       }
     }
-    if (foreign.length) await waitPast(jobId, 3, tag);
+    if (foreign.length) await waitPast(deps, jobId, PHASE.REVEAL);
     if (Number((await chain.job(jobId)).phase) < 7) await tx(funder, plans.arms(cfg, `${tag}: settle job ${jobId}`, "settle", [jobId]));
     const j = await chain.job(jobId);
     log(`    phase ${PHASES[Number(j.phase)]}`);
