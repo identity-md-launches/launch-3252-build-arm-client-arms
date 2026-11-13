@@ -72,6 +72,14 @@ export async function readKeys(inp: ReaderInput): Promise<ReaderOutput> {
   /** selectors present in the code that executes at `a` (following a 7702 delegation and a 1167 clone). */
   async function effectiveSelectors(a: string): Promise<{ has: boolean; hasDelegatecall: boolean }> {
     let code = await codeOf(a);
+    // For the target, once Key 2 resolved the EIP-1967/beacon/1822 implementation, the proxy's own
+    // DELEGATECALL is that forwarding: owner() is absent if neither the proxy code nor the code that
+    // finally runs behind the implementation has the selector, and that code does not delegate further.
+    if (a === target && execImpl && execImpl.toLowerCase() !== target) {
+      const own = scan(code).selectors.has(SEL_OWNER.slice(2));
+      const behind = await effectiveSelectors(execImpl);
+      return { has: own || behind.has, hasDelegatecall: behind.hasDelegatecall };
+    }
     const seen: string[] = [];
     for (let i = 0; i < 3; i++) {
       const d = parseDelegation(code) ?? parseMinimalProxy(code)?.impl;
@@ -145,6 +153,7 @@ export async function readKeys(inp: ReaderInput): Promise<ReaderOutput> {
   }
 
   const typeWord = (t: string): Hex => encodeLabel(t);
+  let execImpl: string | null = null; // implementation behind an EIP-1967 / beacon / EIP-1822 target, once known
 
   try {
     const code = await codeOf(target);
@@ -185,23 +194,26 @@ export async function readKeys(inp: ReaderInput): Promise<ReaderOutput> {
       if (!sc.delegatecall) {
         rows[0] = UNK(`read #${codeRead} eth_getCode`, "a proxy slot is set but the bytecode has no DELEGATECALL, so dispatch cannot be confirmed");
         rows[1] = UNK(`read #${codeRead} eth_getCode`, "Key 1 unresolved"); rows[2] = UNK(`read #${codeRead} eth_getCode`, "Key 1 unresolved");
-      } else if (nz(implA)) {
-        rows[0] = W(typeWord("YES"), `EIP-1967 implementation slot (read #${implN}) is set and bytecode has DELEGATECALL`);
-        rows[1] = W(encodeAddress(implA!), `EIP-1967 implementation slot = ${implA}`);
-        if (nz(adminA)) { admin = adminA; rows[2] = W(encodeAddress(adminA!), `EIP-1967 admin slot (read #${adminN}) = ${adminA} (transparent proxy)`); }
-        else rows[2] = NA("EIP-1967 admin slot is zero: UUPS-style proxy without a distinct admin (owner is not a proxy admin)");
       } else if (nz(beaconA)) {
+        // The beacon slot wins: a beacon proxy may also mirror the implementation in the implementation slot.
         adminIsBeacon = true; admin = beaconA;
         rows[0] = W(typeWord("YES"), `EIP-1967 beacon slot (read #${beaconN}) is set and bytecode has DELEGATECALL`);
         rows[2] = W(encodeAddress(beaconA!), `EIP-1967 beacon slot = ${beaconA}`);
         const r = await tryCall(rpc, beaconA!, SEL_IMPLEMENTATION, block);
         const n = lastN();
         const ia = r.ok && r.data.length === 66 ? addrOfWord(r.data) : null;
-        rows[1] = ia ? W(encodeAddress(ia), `beacon.implementation() (read #${n}) = ${ia}`) : UNK(`read #${n} eth_call beacon.implementation()`, "beacon did not return an implementation");
+        if (!ia) rows[1] = UNK(`read #${n} eth_call beacon.implementation()`, "beacon did not return an implementation");
+        else if (nz(implA) && implA!.toLowerCase() !== ia.toLowerCase()) rows[1] = UNK(`read #${implN} eth_getStorageAt implementation slot / read #${n} beacon.implementation()`, `both EIP-1967 beacon and implementation slots are set and disagree (slot ${implA}, beacon ${ia}): which one runs cannot be told from bytecode`);
+        else { rows[1] = W(encodeAddress(ia), `beacon.implementation() (read #${n}) = ${ia}${nz(implA) ? " (implementation slot mirrors it)" : ""}`); execImpl = ia; }
+      } else if (nz(implA)) {
+        rows[0] = W(typeWord("YES"), `EIP-1967 implementation slot (read #${implN}) is set and bytecode has DELEGATECALL`);
+        rows[1] = W(encodeAddress(implA!), `EIP-1967 implementation slot = ${implA}`); execImpl = implA;
+        if (nz(adminA)) { admin = adminA; rows[2] = W(encodeAddress(adminA!), `EIP-1967 admin slot (read #${adminN}) = ${adminA} (transparent proxy)`); }
+        else rows[2] = NA("EIP-1967 admin slot is zero: UUPS-style proxy without a distinct admin (owner is not a proxy admin)");
       } else {
         // EIP-1822 PROXIABLE slot
         rows[0] = W(typeWord("YES"), "EIP-1822 PROXIABLE slot is set and bytecode has DELEGATECALL");
-        rows[1] = W(encodeAddress(proxA!), `PROXIABLE slot = ${proxA}`);
+        rows[1] = W(encodeAddress(proxA!), `PROXIABLE slot = ${proxA}`); execImpl = proxA;
         rows[2] = NA("EIP-1822 has no admin");
       }
     } else {

@@ -21875,6 +21875,7 @@ __export(keys_exports, {
   NOT_APPLICABLE: () => NOT_APPLICABLE,
   UNKNOWN: () => UNKNOWN,
   ZERO_WORD: () => ZERO_WORD,
+  commitValues: () => commitValues,
   decodeAnswer: () => decodeAnswer,
   encodeAddress: () => encodeAddress3,
   encodeAnswer: () => encodeAnswer,
@@ -21914,6 +21915,14 @@ function validateAnswer(key, a) {
     return;
   }
   if (!ENUMS[key]?.includes(a)) throw new Error(`key ${key}: ${a} is not one of ${ENUMS[key]?.join("/")}`);
+}
+function commitValues(raw, keys) {
+  if (!Array.isArray(raw) || raw.some((v) => typeof v !== "string")) throw new Error("--values file must be a JSON array of strings");
+  if (raw.length !== keys.length) throw new Error(`${keys.length} values required (keys ${keys.join(",")}), file has ${raw.length}: refusing to commit an unrevealable answer`);
+  return raw.map((v, i) => {
+    validateAnswer(keys[i], v);
+    return encodeAnswer(v);
+  });
 }
 var NOT_APPLICABLE, UNKNOWN, ZERO_WORD, KEY_NAMES, ENUMS;
 var init_keys = __esm({
@@ -22470,6 +22479,11 @@ async function readKeys(inp) {
   }
   async function effectiveSelectors(a) {
     let code = await codeOf(a);
+    if (a === target && execImpl && execImpl.toLowerCase() !== target) {
+      const own = scan(code).selectors.has(SEL_OWNER.slice(2));
+      const behind = await effectiveSelectors(execImpl);
+      return { has: own || behind.has, hasDelegatecall: behind.hasDelegatecall };
+    }
     const seen = [];
     for (let i = 0; i < 3; i++) {
       const d = parseDelegation(code) ?? parseMinimalProxy(code)?.impl;
@@ -22537,6 +22551,7 @@ async function readKeys(inp) {
     }
   }
   const typeWord = (t) => encodeLabel(t);
+  let execImpl = null;
   try {
     const code = await codeOf(target);
     const codeRead = lastN();
@@ -22582,13 +22597,6 @@ async function readKeys(inp) {
         rows[0] = UNK(`read #${codeRead} eth_getCode`, "a proxy slot is set but the bytecode has no DELEGATECALL, so dispatch cannot be confirmed");
         rows[1] = UNK(`read #${codeRead} eth_getCode`, "Key 1 unresolved");
         rows[2] = UNK(`read #${codeRead} eth_getCode`, "Key 1 unresolved");
-      } else if (nz(implA)) {
-        rows[0] = W(typeWord("YES"), `EIP-1967 implementation slot (read #${implN}) is set and bytecode has DELEGATECALL`);
-        rows[1] = W(encodeAddress3(implA), `EIP-1967 implementation slot = ${implA}`);
-        if (nz(adminA)) {
-          admin = adminA;
-          rows[2] = W(encodeAddress3(adminA), `EIP-1967 admin slot (read #${adminN}) = ${adminA} (transparent proxy)`);
-        } else rows[2] = NA("EIP-1967 admin slot is zero: UUPS-style proxy without a distinct admin (owner is not a proxy admin)");
       } else if (nz(beaconA)) {
         adminIsBeacon = true;
         admin = beaconA;
@@ -22597,10 +22605,24 @@ async function readKeys(inp) {
         const r = await tryCall(rpc, beaconA, SEL_IMPLEMENTATION, block);
         const n = lastN();
         const ia = r.ok && r.data.length === 66 ? addrOfWord(r.data) : null;
-        rows[1] = ia ? W(encodeAddress3(ia), `beacon.implementation() (read #${n}) = ${ia}`) : UNK(`read #${n} eth_call beacon.implementation()`, "beacon did not return an implementation");
+        if (!ia) rows[1] = UNK(`read #${n} eth_call beacon.implementation()`, "beacon did not return an implementation");
+        else if (nz(implA) && implA.toLowerCase() !== ia.toLowerCase()) rows[1] = UNK(`read #${implN} eth_getStorageAt implementation slot / read #${n} beacon.implementation()`, `both EIP-1967 beacon and implementation slots are set and disagree (slot ${implA}, beacon ${ia}): which one runs cannot be told from bytecode`);
+        else {
+          rows[1] = W(encodeAddress3(ia), `beacon.implementation() (read #${n}) = ${ia}${nz(implA) ? " (implementation slot mirrors it)" : ""}`);
+          execImpl = ia;
+        }
+      } else if (nz(implA)) {
+        rows[0] = W(typeWord("YES"), `EIP-1967 implementation slot (read #${implN}) is set and bytecode has DELEGATECALL`);
+        rows[1] = W(encodeAddress3(implA), `EIP-1967 implementation slot = ${implA}`);
+        execImpl = implA;
+        if (nz(adminA)) {
+          admin = adminA;
+          rows[2] = W(encodeAddress3(adminA), `EIP-1967 admin slot (read #${adminN}) = ${adminA} (transparent proxy)`);
+        } else rows[2] = NA("EIP-1967 admin slot is zero: UUPS-style proxy without a distinct admin (owner is not a proxy admin)");
       } else {
         rows[0] = W(typeWord("YES"), "EIP-1822 PROXIABLE slot is set and bytecode has DELEGATECALL");
         rows[1] = W(encodeAddress3(proxA), `PROXIABLE slot = ${proxA}`);
+        execImpl = proxA;
         rows[2] = NA("EIP-1822 has no admin");
       }
     } else {
@@ -22768,6 +22790,7 @@ function validateAgentOutput(raw, enforceEvidence = true) {
   const values = [];
   const o2 = raw ?? {};
   const ev = Array.isArray(o2.evidence) ? o2.evidence : [];
+  const got = {};
   for (let k = 8; k <= 13; k++) {
     let a = o2.answers?.[String(k)];
     if (typeof a !== "string") {
@@ -22782,15 +22805,48 @@ function validateAgentOutput(raw, enforceEvidence = true) {
         throw new Error("no evidence entry (kind fact|inference, file, line)");
       }
       values.push(encodeAnswer(a));
+      got[k] = a;
     } catch (e) {
       problems.push(`key ${k}: ${e.message}; using UNKNOWN`);
       values.push(UNKNOWN);
+      got[k] = "UNKNOWN";
     }
   }
+  const set = (k, v, why) => {
+    if (got[k] !== v) {
+      problems.push(`key ${k}: ${got[k]} contradicts the form (${why}); using ${v}`);
+      got[k] = v;
+      values[k - 8] = encodeAnswer(v);
+    }
+  };
+  if (got[9] === "NO" || got[9] === "NOT_APPLICABLE") set(10, "NOT_APPLICABLE", `Key 9 is ${got[9]}`);
+  else if (got[9] === "UNKNOWN") set(10, "UNKNOWN", "Key 9 is UNKNOWN");
+  else if (got[10] === "NOT_APPLICABLE") set(10, "UNKNOWN", "Key 9 is YES, so Key 10 cannot be NOT_APPLICABLE");
+  const powers = [8, 9, 11, 12].map((k) => got[k]);
+  if (powers.includes("UNKNOWN")) set(13, "UNKNOWN", "a power key is UNKNOWN, so the delay category may change");
+  else if (!powers.includes("YES")) set(13, "NOT_APPLICABLE", "no power identified by Keys 8, 9, 11, 12");
+  else if (got[13] === "NOT_APPLICABLE") set(13, "UNKNOWN", "a power is identified, so Key 13 cannot be NOT_APPLICABLE");
   return { values, problems, evidence: ev };
 }
 function unknownKeys8to13(why) {
   return { values: Array(6).fill(UNKNOWN), problems: [why], evidence: [] };
+}
+var AGENT_BASE_ENV = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "TZ"];
+var secretEnvNames = /* @__PURE__ */ new Set();
+function registerSecretEnv(name) {
+  if (name) secretEnvNames.add(name);
+}
+function agentEnv(cfg, jobDir, parent = process.env) {
+  const deny = new Set(secretEnvNames);
+  for (const n of [cfg.key?.env, cfg.rpcUrlEnv, cfg.etherscanKeyEnv]) if (n) deny.add(n);
+  const env = {};
+  for (const n of [...AGENT_BASE_ENV, ...cfg.agent?.passEnv ?? []]) {
+    const v = parent[n];
+    if (v !== void 0 && !deny.has(n)) env[n] = v;
+  }
+  env.ARMS_JOB_DIR = jobDir;
+  env.ARMS_SKILL = resolve(cfg.skillPath);
+  return env;
 }
 async function runAgent(cfg, jobDirArg) {
   const jobDir = resolve(jobDirArg);
@@ -22799,7 +22855,7 @@ async function runAgent(cfg, jobDirArg) {
   const argv = tmpl.map((s) => s.replaceAll("{jobdir}", jobDir).replaceAll("{skill}", resolve(cfg.skillPath)).replaceAll("{prompt}", prompt));
   const log2 = [];
   await new Promise((res) => {
-    const p = spawn(argv[0], argv.slice(1), { cwd: jobDir, env: { ...process.env, ARMS_JOB_DIR: jobDir, ARMS_SKILL: resolve(cfg.skillPath) }, stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(argv[0], argv.slice(1), { cwd: jobDir, env: agentEnv(cfg, jobDir), stdio: ["ignore", "pipe", "pipe"] });
     const t = setTimeout(() => p.kill("SIGKILL"), (cfg.agent?.timeoutSeconds ?? 1800) * 1e3);
     p.stdout.on("data", (d) => log2.push(String(d)));
     p.stderr.on("data", (d) => log2.push(String(d)));
@@ -22992,6 +23048,8 @@ async function main() {
   const chain = new Chain(cfg, rpcUrlOf(cfg));
   if (cfg.chainId !== 11155111) throw new Error("live run is for Sepolia (11155111)");
   const keySrc = S(o["key-file"]) || S(o["key-env"]) ? { file: S(o["key-file"]), env: S(o["key-env"]) } : cfg.key;
+  registerSecretEnv(keySrc?.env);
+  registerSecretEnv(cfg.key?.env);
   const funder = accountFrom(keySrc);
   const wdir = S(o.wallets);
   const stateFile = join4(wdir, "live-state.json");
@@ -23097,8 +23155,30 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
     if (mf === 0n || stopped !== 0n) await tx(a, plans.arms(cfg, `${n} serve at 1e18`, "serve", [spec.formId, FEE]));
   }
   const store = new SaltStore(join4(wdir, "live-salts.json"));
-  const honest = await honestAnswers(cfg, chain, S(o.target), S(o["honest-file"]), wdir);
   const mine = (addr) => names.map((n) => accounts[n]).find((a) => a.address.toLowerCase() === addr.toLowerCase());
+  const honestAt = async (tag, atBlock) => {
+    const k = `${tag}Honest`;
+    if (state[k]?.atBlock === atBlock.toString()) return state[k].values;
+    const h = await honestAnswers(cfg, S(o.target), S(o["honest-file"]), join4(wdir, `honest-${tag}`), atBlock);
+    state[k] = { atBlock: atBlock.toString(), values: h.values };
+    saveState();
+    return h.values;
+  };
+  const waitPast = async (jobId, phase, tag) => {
+    for (; ; ) {
+      const j = await chain.job(jobId);
+      if (Number(j.phase) !== phase) return;
+      if (await chain.now() > BigInt(j.deadline)) {
+        try {
+          await tx(funder, plans.arms(cfg, `${tag}: timeout job ${jobId} in ${PHASES[phase]}`, "timeout", [jobId]));
+        } catch (e) {
+          log(`    timeout not yet possible: ${String(e.message).slice(0, 120)}`);
+        }
+        if (Number((await chain.job(jobId)).phase) !== phase) return;
+      }
+      await sleep(15e3);
+    }
+  };
   const runJob = async (tag, vals, atBlock) => {
     if (state[tag]?.settled) return BigInt(state[tag].jobId);
     let jobId;
@@ -23126,7 +23206,14 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
     const drawn = await chain.arms("armsOf", jobId);
     log(`    drawn: ${drawn.join(", ")}`);
     state[tag].drawn = drawn;
-    for (const a of drawn) {
+    const foreign = drawn.filter((a) => !mine(a));
+    if (foreign.length) {
+      const m = `${tag}: the draw picked arm(s) that are not this script's wallets (${foreign.join(", ")}); they answer on their own, the script commits only for its arms and waits for the phase deadlines`;
+      log(`    ${m}`);
+      if (!mismatches.includes(m)) mismatches.push(m);
+    }
+    const own = drawn.filter((a) => mine(a));
+    for (const a of own) {
       const w = mine(a);
       const v = vals(a);
       const id = SaltStore.id(11155111, cfg.arms, jobId, a);
@@ -23137,8 +23224,14 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
         store.mark(id, "committed");
       }
     }
-    for (let i = 0; i < 20 && Number((await chain.job(jobId)).phase) === 2; i++) await sleep(5e3);
-    for (const a of drawn) {
+    if (foreign.length) await waitPast(jobId, 2, tag);
+    else for (let i = 0; i < 20 && Number((await chain.job(jobId)).phase) === 2; i++) await sleep(5e3);
+    if (Number((await chain.job(jobId)).phase) === 8) {
+      delete state[tag];
+      saveState();
+      throw new Error(`${tag}: job ${jobId} was cancelled (not enough commits); rerun to post a new job`);
+    }
+    for (const a of own) {
       const id = SaltStore.id(11155111, cfg.arms, jobId, a);
       const rec = store.get(id);
       const e = await chain.entry(jobId, a);
@@ -23147,7 +23240,8 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
         store.mark(id, "revealed");
       }
     }
-    await tx(funder, plans.arms(cfg, `${tag}: settle job ${jobId}`, "settle", [jobId]));
+    if (foreign.length) await waitPast(jobId, 3, tag);
+    if (Number((await chain.job(jobId)).phase) < 7) await tx(funder, plans.arms(cfg, `${tag}: settle job ${jobId}`, "settle", [jobId]));
     const j = await chain.job(jobId);
     log(`    phase ${PHASES[Number(j.phase)]}`);
     state[tag].settled = true;
@@ -23157,15 +23251,17 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
   log("\n[5] job one: honest check");
   const head = await chain.pub.getBlockNumber();
   const block1 = BigInt(state.job1?.atBlock ?? head - 12n);
-  const job1 = await runJob("job1", () => honest.values, block1);
+  const honest1 = await honestAt("job1", block1);
+  const job1 = await runJob("job1", () => honest1, block1);
   const v1 = await chain.arms("verdict", job1);
   log(`    verdict: ${v1.values.map((w, i) => `${i + 1}=${decodeAnswer(w)}`).join(" ")}`);
   log("\n[6] job two: wrong key-index-8 value from every drawn arm, then a challenge");
-  const rightKey9 = honest.values[8];
+  const block2 = BigInt(state.job2?.atBlock ?? await chain.pub.getBlockNumber() - 12n);
+  const honest2 = await honestAt("job2", block2);
+  const rightKey9 = honest2[8];
   const wrong = rightKey9 === encodeLabel("YES") ? encodeLabel("NO") : encodeLabel("YES");
   if (rightKey9 === UNKNOWN) throw new Error("key 9 honest answer is UNKNOWN: supply --honest-file with a true key 9 answer");
-  const block2 = BigInt(state.job2?.atBlock ?? await chain.pub.getBlockNumber() - 12n);
-  const job2 = await runJob("job2", () => honest.values.map((v, i) => i === 8 ? wrong : v), block2);
+  const job2 = await runJob("job2", () => honest2.map((v, i) => i === 8 ? wrong : v), block2);
   const j2 = await chain.job(job2);
   const [storedVal, status] = await chain.arms("results", job2, 8);
   log(`    stored value for index 8: ${decodeAnswer(storedVal)} (status ${status}); challenger claims ${decodeAnswer(rightKey9)}`);
@@ -23248,14 +23344,13 @@ funder holds ${formatEther2(have.eth)} ETH / ${fmt(have.armt)} ARMT / ${fmt(have
   log(`
 wrote ${o.report}`);
 }
-async function honestAnswers(cfg, chain, target, file, wdir) {
-  const block = await chain.pub.getBlockNumber() - 12n;
+async function honestAnswers(cfg, target, file, dir, block) {
   if (file) {
     const j = JSON.parse(readFileSync5(file, "utf8"));
-    const ans2 = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir: join4(wdir, "honest"), skipAgent: true });
+    const ans2 = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir, skipAgent: true });
     return { values: [...ans2.values.slice(0, 7), ...[8, 9, 10, 11, 12, 13].map((k) => j[String(k)] ? encodeAnswer(j[String(k)]) : UNKNOWN)] };
   }
-  const ans = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir: join4(wdir, "honest"), etherscanKey: cfg.etherscanKeyEnv ? process.env[cfg.etherscanKeyEnv] : void 0 });
+  const ans = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir, etherscanKey: cfg.etherscanKeyEnv ? process.env[cfg.etherscanKeyEnv] : void 0 });
   return { values: ans.values };
 }
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));

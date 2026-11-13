@@ -8,9 +8,10 @@ import { Chain, execute, plans, jsonSafe, fmt, parseTokens } from "./chain.js";
 import { accountFrom } from "./wallet.js";
 import { PHASES, STATUSES, RULINGS, armsAbi, erc20Abi } from "./abi.js";
 import { SaltStore, commitmentHash } from "./salts.js";
-import { encodeAnswer, decodeAnswer, KEY_NAMES } from "./keys.js";
+import { encodeAnswer, decodeAnswer, commitValues, KEY_NAMES } from "./keys.js";
 import { readKeys } from "./reader.js";
 import { answerJob, evidenceUriOf, sourceTargets } from "./pipeline.js";
+import { registerSecretEnv } from "./agent.js";
 import { fetchSource } from "./source.js";
 import { runLoop } from "./run.js";
 import { imdRequestCheck } from "./oracle.js";
@@ -50,6 +51,7 @@ async function main() {
   if (cmd === "score") { console.log(jsonSafe(scoreAgent(JSON.parse(readFileSync(a1!, "utf8")), JSON.parse(readFileSync(a2!, "utf8"))))); return; }
   const cfg = loadConfig(str(opt.config)!);
   const keySrc = str(opt["key-file"]) || str(opt["key-env"]) ? { file: str(opt["key-file"]), env: str(opt["key-env"]) } : cfg.key;
+  registerSecretEnv(keySrc?.env); registerSecretEnv(cfg.key?.env);
   const targetRpc = (id: number) => str(opt.rpc) ?? cfg.readerRpc[String(id)] ?? (id === cfg.chainId ? rpcUrlOf(cfg) : (() => { throw new Error(`no readerRpc for chain ${id} in config`); })());
   const etherscanKey = cfg.etherscanKeyEnv ? process.env[cfg.etherscanKeyEnv] : undefined;
   const send = !!opt.send;
@@ -139,7 +141,11 @@ async function main() {
     case "settle": await write(needKey(), plans.arms(cfg, `settle job ${a1}`, "settle", [job])); return;
     case "commit": {
       const acct = arm(); const me = acct.address.toLowerCase();
-      const vals: Hex[] = (JSON.parse(readFileSync(str(opt.values)!, "utf8")) as string[]).map(encodeAnswer);
+      const raw = JSON.parse(readFileSync(str(opt.values)!, "utf8")) as unknown;
+      const j = await chain.job(job);
+      const tie = String(j.tieBreaker).toLowerCase() === me;
+      const keys = tie ? Array.from({ length: 13 }, (_, k) => k).filter((k) => (Number(j.disputedMask) & (1 << k)) !== 0).map((k) => k + 1) : Array.from({ length: Number(j.keyCount) || 13 }, (_, k) => k + 1);
+      const vals = commitValues(raw, keys);
       const store = new SaltStore(cfg.saltsFile);
       const rec = store.prepare(SaltStore.id(cfg.chainId, cfg.arms, job, me), job, me, vals);
       const out = await write(acct, plans.arms(cfg, `commit job ${a1}`, "commit", [job, me, rec.hash]));

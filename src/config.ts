@@ -13,7 +13,7 @@ export interface ArmsConfig {
   sourcesDir: string; evidenceDir: string;
   etherscanKeyEnv?: string; etherscanBase?: string;
   skillPath: string;
-  agent?: { command?: string[]; timeoutSeconds?: number }; // command run with the job dir, writes answers.json
+  agent?: { command?: string[]; timeoutSeconds?: number; passEnv?: string[] }; // command run with the job dir, writes answers.json; passEnv: extra env names the agent may see
   pollSeconds: number;
   readerRpc: { [chainId: string]: string };        // RPC URL per target chain, for reading targets
 }

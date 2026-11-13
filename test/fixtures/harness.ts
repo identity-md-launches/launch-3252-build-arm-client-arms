@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createPublicClient, createWalletClient, http, encodeFunctionData, encodeDeployData, type Abi, type Address, type Hex, parseAbi } from "viem";
 
-const planted: Record<string, { abi: Abi; bytecode: Hex }> = JSON.parse(readFileSync("test/fixtures/planted.json", "utf8"));
+export const planted: Record<string, { abi: Abi; bytecode: Hex }> = JSON.parse(readFileSync("test/fixtures/planted.json", "utf8"));
 export const expected: Record<string, Record<string, string> & { desc: string }> = JSON.parse(readFileSync("test/fixtures/expected.json", "utf8"));
 
 export interface Deployed { address: Address; refs: Record<string, string> }

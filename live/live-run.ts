@@ -15,6 +15,7 @@ import { Chain, execute, plans, fmt, parseTokens, jsonSafe, type TxOutcome, type
 import { accountFrom } from "../src/wallet.js";
 import { formSpec } from "../src/form.js";
 import { answerJob } from "../src/pipeline.js";
+import { registerSecretEnv } from "../src/agent.js";
 import { SaltStore } from "../src/salts.js";
 import { encodeAnswer, encodeLabel, decodeAnswer, UNKNOWN } from "../src/keys.js";
 import { imdRequestCheck } from "../src/oracle.js";
@@ -40,6 +41,7 @@ async function main() {
   const chain = new Chain(cfg, rpcUrlOf(cfg));
   if (cfg.chainId !== 11155111) throw new Error("live run is for Sepolia (11155111)");
   const keySrc = S(o["key-file"]) || S(o["key-env"]) ? { file: S(o["key-file"]), env: S(o["key-env"]) } : cfg.key;
+  registerSecretEnv(keySrc?.env); registerSecretEnv(cfg.key?.env);
   const funder = accountFrom(keySrc);
   const wdir = S(o.wallets); const stateFile = join(wdir, "live-state.json");
   const state: any = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : {};
@@ -125,8 +127,26 @@ async function main() {
 
   // ---- 5/6 jobs ----
   const store = new SaltStore(join(wdir, "live-salts.json"));
-  const honest = await honestAnswers(cfg, chain, S(o.target), S(o["honest-file"]), wdir);
-  const mine = (addr: string) => names.map((n) => accounts[n]!).find((a) => a.address.toLowerCase() === addr.toLowerCase())!;
+  const mine = (addr: string) => names.map((n) => accounts[n]!).find((a) => a.address.toLowerCase() === addr.toLowerCase());
+  // Honest answers are read at the exact block the job is posted for, once per job, and kept for restarts.
+  const honestAt = async (tag: string, atBlock: bigint): Promise<Hex[]> => {
+    const k = `${tag}Honest`;
+    if (state[k]?.atBlock === atBlock.toString()) return state[k].values as Hex[];
+    const h = await honestAnswers(cfg, S(o.target), S(o["honest-file"]), join(wdir, `honest-${tag}`), atBlock);
+    state[k] = { atBlock: atBlock.toString(), values: h.values }; saveState();
+    return h.values;
+  };
+  // Wait while the job sits in `phase`; once its deadline has passed, call timeout() so no-shows (e.g. a foreign arm) are closed.
+  const waitPast = async (jobId: bigint, phase: number, tag: string) => {
+    for (;;) {
+      const j = await chain.job(jobId); if (Number(j.phase) !== phase) return;
+      if ((await chain.now()) > BigInt(j.deadline)) {
+        try { await tx(funder, plans.arms(cfg, `${tag}: timeout job ${jobId} in ${PHASES[phase]}`, "timeout", [jobId])); } catch (e: any) { log(`    timeout not yet possible: ${String(e.message).slice(0, 120)}`); }
+        if (Number((await chain.job(jobId)).phase) !== phase) return;
+      }
+      await sleep(15_000);
+    }
+  };
 
   const runJob = async (tag: string, vals: (arm: string) => Hex[], atBlock: bigint): Promise<bigint> => {
     if (state[tag]?.settled) return BigInt(state[tag].jobId);
@@ -148,18 +168,27 @@ async function main() {
     const drawn = await chain.arms<Address[]>("armsOf", jobId);
     log(`    drawn: ${drawn.join(", ")}`);
     state[tag].drawn = drawn;
-    for (const a of drawn) {
-      const w = mine(a); const v = vals(a); const id = SaltStore.id(11155111, cfg.arms, jobId, a);
+    const foreign = drawn.filter((a) => !mine(a));
+    if (foreign.length) {
+      const m = `${tag}: the draw picked arm(s) that are not this script's wallets (${foreign.join(", ")}); they answer on their own, the script commits only for its arms and waits for the phase deadlines`;
+      log(`    ${m}`); if (!mismatches.includes(m)) mismatches.push(m);
+    }
+    const own = drawn.filter((a) => mine(a));
+    for (const a of own) {
+      const w = mine(a)!; const v = vals(a); const id = SaltStore.id(11155111, cfg.arms, jobId, a);
       const rec = store.prepare(id, jobId, a, v, `live-run:${tag}`);
       const e = await chain.entry(jobId, a);
       if (!e.committed) { await tx(w, plans.arms(cfg, `${tag}: commit job ${jobId} by ${a}`, "commit", [jobId, a, rec.hash])); store.mark(id, "committed"); }
     }
-    for (let i = 0; i < 20 && Number((await chain.job(jobId)).phase) === 2; i++) await sleep(5_000);
-    for (const a of drawn) {
+    if (foreign.length) await waitPast(jobId, 2, tag);
+    else for (let i = 0; i < 20 && Number((await chain.job(jobId)).phase) === 2; i++) await sleep(5_000);
+    if (Number((await chain.job(jobId)).phase) === 8) { delete state[tag]; saveState(); throw new Error(`${tag}: job ${jobId} was cancelled (not enough commits); rerun to post a new job`); }
+    for (const a of own) {
       const id = SaltStore.id(11155111, cfg.arms, jobId, a); const rec = store.get(id)!; const e = await chain.entry(jobId, a);
-      if (!e.revealed) { await tx(mine(a), plans.arms(cfg, `${tag}: reveal job ${jobId} by ${a}`, "reveal", [jobId, a, rec.values, rec.salt, rec.evidenceURI])); store.mark(id, "revealed"); }
+      if (!e.revealed) { await tx(mine(a)!, plans.arms(cfg, `${tag}: reveal job ${jobId} by ${a}`, "reveal", [jobId, a, rec.values, rec.salt, rec.evidenceURI])); store.mark(id, "revealed"); }
     }
-    await tx(funder, plans.arms(cfg, `${tag}: settle job ${jobId}`, "settle", [jobId]));
+    if (foreign.length) await waitPast(jobId, 3, tag);
+    if (Number((await chain.job(jobId)).phase) < 7) await tx(funder, plans.arms(cfg, `${tag}: settle job ${jobId}`, "settle", [jobId]));
     const j = await chain.job(jobId); log(`    phase ${PHASES[Number(j.phase)]}`);
     state[tag].settled = true; saveState();
     return jobId;
@@ -168,16 +197,18 @@ async function main() {
   log("\n[5] job one: honest check");
   const head = await chain.pub.getBlockNumber();
   const block1 = BigInt(state.job1?.atBlock ?? head - 12n);
-  const job1 = await runJob("job1", () => honest.values, block1);
+  const honest1 = await honestAt("job1", block1);
+  const job1 = await runJob("job1", () => honest1, block1);
   const v1 = await chain.arms<any>("verdict", job1);
   log(`    verdict: ${v1.values.map((w: Hex, i: number) => `${i + 1}=${decodeAnswer(w)}`).join(" ")}`);
 
   log("\n[6] job two: wrong key-index-8 value from every drawn arm, then a challenge");
-  const rightKey9 = honest.values[8]!;
+  const block2 = BigInt(state.job2?.atBlock ?? (await chain.pub.getBlockNumber()) - 12n);
+  const honest2 = await honestAt("job2", block2);
+  const rightKey9 = honest2[8]!;
   const wrong = rightKey9 === encodeLabel("YES") ? encodeLabel("NO") : encodeLabel("YES");
   if (rightKey9 === UNKNOWN) throw new Error("key 9 honest answer is UNKNOWN: supply --honest-file with a true key 9 answer");
-  const block2 = BigInt(state.job2?.atBlock ?? (await chain.pub.getBlockNumber()) - 12n);
-  const job2 = await runJob("job2", () => honest.values.map((v, i) => (i === 8 ? wrong : v)), block2);
+  const job2 = await runJob("job2", () => honest2.map((v, i) => (i === 8 ? wrong : v)), block2);
   const j2 = await chain.job(job2);
   const [storedVal, status] = await chain.arms<[Hex, number]>("results", job2, 8);
   log(`    stored value for index 8: ${decodeAnswer(storedVal)} (status ${status}); challenger claims ${decodeAnswer(rightKey9)}`);
@@ -224,13 +255,12 @@ async function main() {
   writeFileSync(S(o.report), rep.join("\n")); log(`\nwrote ${o.report}`);
 }
 
-async function honestAnswers(cfg: any, chain: Chain, target: string, file: string | undefined, wdir: string) {
-  const block = (await chain.pub.getBlockNumber()) - 12n;
+async function honestAnswers(cfg: any, target: string, file: string | undefined, dir: string, block: bigint) {
   if (file) {
-    const j = JSON.parse(readFileSync(file, "utf8")); const ans = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir: join(wdir, "honest"), skipAgent: true });
+    const j = JSON.parse(readFileSync(file, "utf8")); const ans = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir, skipAgent: true });
     return { values: [...ans.values.slice(0, 7), ...[8, 9, 10, 11, 12, 13].map((k) => (j[String(k)] ? encodeAnswer(j[String(k)]) : UNKNOWN))] as Hex[] };
   }
-  const ans = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir: join(wdir, "honest"), etherscanKey: cfg.etherscanKeyEnv ? process.env[cfg.etherscanKeyEnv] : undefined });
+  const ans = await answerJob(cfg, { chainId: 11155111, target, block, rpcUrl: rpcUrlOf(cfg), dir, etherscanKey: cfg.etherscanKeyEnv ? process.env[cfg.etherscanKeyEnv] : undefined });
   return { values: ans.values };
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

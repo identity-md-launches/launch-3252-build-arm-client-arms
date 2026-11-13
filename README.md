@@ -34,7 +34,7 @@ The 20 planted contracts are precompiled into `test/fixtures/planted.json`; `SOL
 Copy `arms.config.example.json` to `arms.config.json`. All addresses live in this one file. It never holds a secret, only
 *where* one is: `key.file` (path) or `key.env` (variable name), `rpcUrlEnv` if the RPC URL embeds an API key,
 `etherscanKeyEnv` (variable name) for the Etherscan-style fallback, `readerRpc` (RPC per target chain, used to read targets),
-and `agent.command` (see below).
+and `agent.command` / `agent.passEnv` (see below).
 
 ## Commands
 
@@ -55,13 +55,18 @@ with `--send` it refuses to pay if the check has blockers. Key indices are zero 
 
 Salts: `commit` and `run` write the salt, the answers and the commitment to `saltsFile` (mode 0600, atomic) **before** the
 commit transaction is sent. A later `reveal` reads that file, so it always matches its commit, also after a crash.
+`commit --values` refuses a file that the contract would reject at reveal: it must hold exactly 13 values (only the disputed
+keys for a tie-break draw), each legal for its key.
 
 ## Running an arm
 
 1. Fund an arm wallet with Sepolia ETH and ARMT; keep its key in a file (`chmod 600`) or an env var.
 2. `arms --send bond 500` then `arms --send serve --min-fee 1`.
 3. Choose how keys 8 to 13 are answered. `agent.command` is run with the job directory as working directory and `ARMS_JOB_DIR`,
-   `ARMS_SKILL` in the environment; `{jobdir}`, `{skill}`, `{prompt}` are substituted. The default is
+   `ARMS_SKILL` in the environment; `{jobdir}`, `{skill}`, `{prompt}` are substituted. The agent does **not** inherit your
+   environment: it gets only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ`, plus any names
+   you list in `agent.passEnv` (for example `["ANTHROPIC_API_KEY"]`). The `key.env` / `--key-env`, `rpcUrlEnv` and `etherscanKeyEnv`
+   variables are always removed, even if listed. The default is
    `claude -p "{prompt}" --permission-mode acceptEdits --add-dir {jobdir}`. It must write `answers.json` as `SKILL.md` describes.
    Use absolute paths for your own scripts. Invalid, missing or evidence-less answers become UNKNOWN (an abstention), never a guess.
    If no source can be read, keys 8 to 13 are UNKNOWN and the agent is not called.
@@ -88,7 +93,11 @@ runs the IMD request check, pays the oracle fee in imdTEST, waits for the real r
 (1,500 bonded, 2 stake, 6 job fees, slack), and **1 imdTEST** (oracle fee 0.5 per challenge, read from the court). ARMT is
 held by the MockToken owner. imdTEST is mintable only by IMD's owner/minters (`ImdTest.mint`), so ask IMD for it. Keys 8 to 13 for the honest
 check come from your agent; pass `--honest-file answers.json` (`{"8":"NO","9":"YES",...}`) to supply them instead.
-Job two needs a TRUE Key 9 answer so the claimed value is right; the script stops if it is UNKNOWN.
+Job two needs a TRUE Key 9 answer so the claimed value is right; the script stops if it is UNKNOWN. The honest answers are read
+at each job's own `atBlock` (once per job, kept in `wallets/live-state.json`), so the evidence in `wallets/honest-job1/` and
+`wallets/honest-job2/` is for the block that job was posted for. If the draw picks an arm that is not one of the script's
+wallets, the script commits and reveals only for its own arms, notes it in the report, waits for the phase deadline and calls
+`timeout`; a job that ends cancelled is posted again on the next run.
 
 **Status: the live run has not been executed.** This build environment had no funded Sepolia wallet, so there is no `report.md`; the
 script was exercised as a dry run against live Sepolia (preflight, form check, balances, court config) only. Known differences
@@ -122,8 +131,8 @@ one-shot genesis `seed` is not a mint path.
 - Read a key from anywhere except the file path or environment variable name you give (flag or config).
 - Print, log, or put a key (or an RPC URL that may embed one) in an error, evidence file, report or config. Evidence keeps only the RPC origin.
 - Write a key anywhere except `wallets/*.key` created by the live script, mode 0600, in a git-ignored folder.
-- Send a transaction without `--send`, send one whose simulation failed, or pass a key to the agent (the agent gets a job directory and no key; its
-  environment is inherited from yours, so do not export keys into the shell that runs `arms run`; use `key.file`).
+- Send a transaction without `--send`, send one whose simulation failed, or pass a key to the agent. The agent gets a job directory and an
+  allow-listed environment (see "Running an arm"); the key, RPC-URL and explorer-key variables are always stripped from it.
 - Read chain state from an explorer. Only JSON-RPC at the pinned block; Sourcify/Etherscan are used for source text only.
 
 ## Review
@@ -132,6 +141,14 @@ No independent reviewer process was available in this run, so this is a self-rev
 local-chain revert errors were not classified as reverts (found by the 20-contract test; now JSON-RPC code 3); the receipt polling made the
 harness crawl; Sourcify rejected one field selector (found against live Sepolia); the agent ran with a relative job path from inside the job dir
 (found by the end-to-end run with a stand-in agent); `run` could reveal with a salt whose hash differs from the on-chain commit (now refused).
+An independent review of the first submission reported six findings, all reproduced and fixed: the agent subprocess inherited
+the whole environment, including a `--key-env` key (now an allow-list, see above); a beacon proxy that also mirrors its
+implementation in the EIP-1967 implementation slot was read as UUPS, making Keys 3, 6, 7 `NOT_APPLICABLE` (the beacon slot now
+wins; disagreeing slots give UNKNOWN for Key 2); Keys 4/5 were UNKNOWN on every proxy whose implementation has no `owner()` (the
+absence proof now scans the resolved implementation); `commit --values` sent commitments the contract could never accept at reveal
+(now length- and per-key-checked); agent answers breaking the form's Key 10 / Key 13 rules were committed (now forced to
+`NOT_APPLICABLE` / `UNKNOWN` as the form says); the live run aborted when a foreign arm was drawn and read its honest answers at a
+different block than it posted. Each has a test except the live-run two, which need Sepolia.
 Open limits: Key 1 `NO` rests on slots, clone prefixes, a DELEGATECALL opcode scan and a loupe probe, not on source; Key 4 absence is
 inferred from the executing bytecode having no `owner()` selector; a proxy with an unknown dispatcher is UNKNOWN; verified source is looked up by
 address, not matched to the block's code hash; the live run and a real agent were not run end to end here.

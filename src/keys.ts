@@ -61,3 +61,10 @@ export function validateAnswer(key: number, a: string): void {
   }
   if (!ENUMS[key]?.includes(a)) throw new Error(`key ${key}: ${a} is not one of ${ENUMS[key]?.join("/")}`);
 }
+
+/** Validate a commit's answers before a salt is made: the reveal must be one the contract accepts (length and per-key legality). */
+export function commitValues(raw: unknown, keys: number[]): Hex[] {
+  if (!Array.isArray(raw) || raw.some((v) => typeof v !== "string")) throw new Error("--values file must be a JSON array of strings");
+  if (raw.length !== keys.length) throw new Error(`${keys.length} values required (keys ${keys.join(",")}), file has ${raw.length}: refusing to commit an unrevealable answer`);
+  return raw.map((v: string, i) => { validateAnswer(keys[i]!, v); return encodeAnswer(v); });
+}

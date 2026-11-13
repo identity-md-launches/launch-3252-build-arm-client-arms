@@ -4,9 +4,9 @@ import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { keccak256, toBytes, type Hex } from "viem";
-import { NOT_APPLICABLE, UNKNOWN, encodeAnswer, encodeLabel, decodeAnswer, validateAnswer } from "../src/keys.js";
+import { NOT_APPLICABLE, UNKNOWN, encodeAnswer, encodeLabel, decodeAnswer, validateAnswer, commitValues } from "../src/keys.js";
 import { SaltStore, commitmentHash } from "../src/salts.js";
-import { validateAgentOutput } from "../src/agent.js";
+import { validateAgentOutput, agentEnv, registerSecretEnv } from "../src/agent.js";
 import { formSpec } from "../src/form.js";
 import { scoreAgent } from "../src/score.js";
 import { loadPrivateKey } from "../src/wallet.js";
@@ -100,4 +100,32 @@ test("key loading never echoes the key", () => {
   assert.throws(() => loadPrivateKey({ file: f }), /chmod 600/);
   assert.throws(() => loadPrivateKey({ env: "ARMS_NOPE_UNSET" }), /empty or unset/);
   assert.throws(() => loadPrivateKey(undefined), /no key source/);
+});
+
+test("agent output: Key 10 follows Key 9 and Key 13 needs an identified power", () => {
+  const ev = [8, 9, 10, 11, 12, 13].map((k) => ({ key: k, kind: "fact", file: "A.sol", line: 1, note: "" }));
+  const r = validateAgentOutput({ answers: { "8": "NO", "9": "NO", "10": "NONE", "11": "NO", "12": "NO", "13": "NONE" }, evidence: ev });
+  assert.equal(r.values[2], NOT_APPLICABLE); assert.equal(r.values[5], NOT_APPLICABLE); assert.equal(r.problems.length, 2);
+  const u = validateAgentOutput({ answers: { "8": "YES", "9": "UNKNOWN", "10": "NONE", "11": "NO", "12": "NO", "13": "ALL" }, evidence: ev });
+  assert.equal(u.values[2], UNKNOWN); assert.equal(u.values[5], UNKNOWN);
+  const ok = validateAgentOutput({ answers: { "8": "YES", "9": "YES", "10": "NONE", "11": "NO", "12": "NO", "13": "SOME" }, evidence: ev });
+  assert.deepEqual(ok.problems, []); assert.equal(ok.values[5], encodeLabel("SOME"));
+});
+
+test("commit refuses a values file the contract could not accept at reveal", () => {
+  const all = Array.from({ length: 13 }, (_, i) => i + 1);
+  const good = ["NO", "NOT_APPLICABLE", "NOT_APPLICABLE", "0x0cc4cab99c475973f658a64814b8b020e7f32e30", "NO_CODE", "NOT_APPLICABLE", "NOT_APPLICABLE", "NO", "NO", "NOT_APPLICABLE", "NO", "NO", "NOT_APPLICABLE"];
+  assert.equal(commitValues(good, all).length, 13);
+  assert.throws(() => commitValues(good.slice(0, 12), all), /13 values required/);
+  const bad = [...good]; bad[1] = "YES"; assert.throws(() => commitValues(bad, all), /key 2 needs an address/);
+  assert.equal(commitValues(["YES"], [9]).length, 1, "tie-breaker commits only the disputed keys");
+});
+
+test("agent environment: no key, RPC-URL or explorer-key variable reaches the agent", () => {
+  const parent = { PATH: "/bin", HOME: "/h", ARM_KEY: "0x" + "ab".repeat(32), FUNDER_KEY: "x", RPC_SECRET: "u", ESCAN: "e", ANTHROPIC_API_KEY: "a", RANDOM: "r" };
+  registerSecretEnv("FUNDER_KEY");
+  const cfg: any = { key: { env: "ARM_KEY" }, rpcUrlEnv: "RPC_SECRET", etherscanKeyEnv: "ESCAN", skillPath: "skills/control-map-source/SKILL.md", agent: { passEnv: ["ANTHROPIC_API_KEY", "ARM_KEY", "FUNDER_KEY"] } };
+  const env = agentEnv(cfg, "/tmp/job", parent);
+  for (const n of ["ARM_KEY", "FUNDER_KEY", "RPC_SECRET", "ESCAN", "RANDOM"]) assert.equal(env[n], undefined, n);
+  assert.equal(env.PATH, "/bin"); assert.equal(env.ANTHROPIC_API_KEY, "a"); assert.equal(env.ARMS_JOB_DIR, "/tmp/job");
 });
