@@ -1,0 +1,16 @@
+{
+  "name": "arms-client",
+  "version": "1.0.0",
+  "description": "Arm client for Arms v1 (bonded checking protocol) on Sepolia: reader, source fetcher, agent skill, CLI, live run",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "arms": "dist/arms.mjs" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/build.mjs --tests && node --test test/.build/*.test.mjs",
+    "fixtures": "node scripts/build-fixtures.mjs"
+  },
+  "dependencies": { "viem": "^2.21.0" },
+  "devDependencies": { "esbuild": "^0.25.0", "typescript": "^5.6.0", "@types/node": "^20.0.0" }
+}

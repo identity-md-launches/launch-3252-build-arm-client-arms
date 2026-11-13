@@ -1,0 +1,21 @@
+{
+  "chainId": 11155111,
+  "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "arms": "0x0cc4cab99c475973f658a64814b8b020e7f32e30",
+  "court": "0x14e2d8744f4fdaedcb13578dbbb1a7e4ac183a31",
+  "token": "0x60f0592275d89034eab8e5aa3023349275aabc37",
+  "form": {
+    "repo": "identity-md-launches/launch-3247-deploy-arms-v1-sepolia",
+    "commit": "ad0f0b417c11d8c713641351b76afdc2fa5bf57f",
+    "path": "forms/control-map-v1.txt"
+  },
+  "key": { "file": "/path/to/arm.key" },
+  "saltsFile": ".arms/salts.json",
+  "sourcesDir": ".arms/sources",
+  "evidenceDir": ".arms/evidence",
+  "etherscanKeyEnv": "ETHERSCAN_API_KEY",
+  "skillPath": "skills/control-map-source/SKILL.md",
+  "agent": { "command": ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits", "--add-dir", "{jobdir}"], "timeoutSeconds": 1800 },
+  "pollSeconds": 20,
+  "readerRpc": { "11155111": "https://ethereum-sepolia-rpc.publicnode.com" }
+}
